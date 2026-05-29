@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""
+Layer 2 — 因子层: 六大核心因子计算 + 标准化 + 打分
+"""
+
+import sys, os, json, logging
+from pathlib import Path
+from typing import Tuple, List, Dict, Optional
+import pandas as pd
+import numpy as np
+
+from config_loader import IE_SCRIPTS, CFG as CONFIG
+from data_provider import get_provider
+from analysis_frameworks import apply_all_frameworks
+from factorhub_source import HAS_FACTORHUB, batch_factorhub_scores
+from anysearch_source import search_sentiment as _anysearch_sentiment, _HAS_ANYSEARCH
+from factor_event import total_event_score as _event_score
+log = logging.getLogger("factor_layer")
+# A-stock-data factors (v3.1, 28 endpoints)
+try:
+    from factor_consensus import factor_consensus
+    HAS_CONSENSUS = True
+except ImportError:
+    HAS_CONSENSUS = False
+try:
+    from factor_capital_flow import factor_capital_flow
+    HAS_CAPITAL_FLOW = True
+except ImportError:
+    HAS_CAPITAL_FLOW = False
+try:
+    from factor_market_signal import factor_market_signal
+    HAS_MARKET_SIGNAL = True
+except ImportError:
+    HAS_MARKET_SIGNAL = False
+
+# Alpha191 精选因子模块（短周期价量因子）
+try:
+    from alpha191_factors import compute_all_alpha191
+    HAS_ALPHA191 = True
+except ImportError:
+    HAS_ALPHA191 = False
+    log.warning("alpha191_factors 未加载，跳过短周期价量因子")
+
+
+
+# ---- 因子阈值配置加载 ----
+FACTOR_THRESHOLDS = CONFIG.get("factor_thresholds", {})
+
+
+def score_by_boundaries(value, boundaries, scores, direction="gt"):
+    """
+    按边界阈值映射数值到分数
+    direction="gt": value > boundary 取分 (高值高分)
+    direction="lt": value < boundary 取分 (低值高分)
+    """
+    for i, b in enumerate(boundaries):
+        is_last = (i == len(boundaries) - 1)
+        if direction == "gt":
+            if value >= b:
+                return scores[i] if i < len(scores) else 0
+        elif direction == "lt":
+            if value <= b:
+                return scores[i] if i < len(scores) else 0
+    return 0
+
+
+
+# ==================== 因子1: 趋势启动 ====================
+def factor_trend(df: pd.DataFrame) -> Dict:
+    """趋势启动因子 - 多周期排列+均线斜率+距新高距离"""
+    if df.empty or len(df) < 60:
+        return {"score": 0, "details": {}}
+    T = FACTOR_THRESHOLDS.get("trend", {})
+    c = df["收盘"].values
+    s = 0; d = {}
+    
+    # 1. 多周期均线排列 (MA5>MA20>MA60 = 多头排列)
+    ma5 = np.mean(c[-5:])
+    ma20 = np.mean(c[-20:])
+    ma60 = np.mean(c[-60:])
+    bull = int(ma5 > ma20 > ma60)
+    partial = int((ma5 > ma20) or (ma20 > ma60))
+    s += bull * T.get("ma_bull_score", 25) + (partial - bull) * T.get("ma_partial_score", 10)
+    d["ma_bull"] = bull; d["ma5"] = round(ma5, 2); d["ma20"] = round(ma20, 2); d["ma60"] = round(ma60, 2)
+    
+    # 2. 均线斜率 (20日均线上升角度)
+    slope_20 = (ma20 - np.mean(c[-40:-20])) / np.mean(c[-40:-20])
+    sl = T.get("slope", {"boundaries": [0.03, 0.01, 0], "scores": [15, 10, 5]})
+    s += score_by_boundaries(slope_20, sl["boundaries"], sl["scores"])
+    d["slope_20"] = round(slope_20*100, 2)
+    
+    # 3. 20日收益率
+    ret_20 = c[-1] / c[-20] - 1
+    r20 = T.get("ret20", {"boundaries": [0.20, 0.10, 0.05, 0.02, 0], "scores": [25, 20, 15, 10, 5]})
+    s += score_by_boundaries(ret_20, r20["boundaries"], r20["scores"])
+    d["ret_20"] = round(ret_20*100, 2)
+    
+    # 4. 60日收益率
+    ret_60 = c[-1] / c[-60] - 1
+    r60 = T.get("ret60", {"boundaries": [0.30, 0.15, 0.05, 0], "scores": [15, 12, 8, 4]})
+    s += score_by_boundaries(ret_60, r60["boundaries"], r60["scores"])
+    d["ret_60"] = round(ret_60*100, 2)
+    
+    # 5. 距120日新高距离
+    high_120 = np.max(c[-120:]) if len(c) >= 120 else c[-1]
+    dist = (c[-1] - high_120) / high_120
+    dh = T.get("dist_from_high", {"boundaries": [0, -0.05, -0.10, -0.20], "scores": [20, 15, 10, 5]})
+    s += score_by_boundaries(dist, dh["boundaries"], dh["scores"])
+    d["dist_from_high"] = round(dist*100, 2); d["high_120"] = round(high_120, 2)
+    
+    return {"score": min(s, 100), "details": d}
+
+
+# ==================== 因子2: 量能异动 ====================
+def factor_volume(df: pd.DataFrame) -> Dict:
+    """量能异动因子 - 放量等级+缩量回踩+连续价量配合"""
+    if df.empty or len(df) < 20 or "成交量" not in df.columns:
+        return {"score": 0, "details": {}}
+    T = FACTOR_THRESHOLDS.get("volume", {})
+    v = df["成交量"].values; c = df["收盘"].values
+    v5 = np.mean(v[-5:]); v20 = np.mean(v[-20:])
+    s = 0; d = {}
+    
+    # 1. 近5日放量等级 (相比20日均量)
+    latest_v5 = v5 / v20 if v20 > 0 else 1
+    vr = T.get("vol_ratio_5v20", {"boundaries": [2.0, 1.5, 1.2, 1.0], "scores": [25, 18, 12, 6]})
+    s += score_by_boundaries(latest_v5, vr["boundaries"], vr["scores"])
+    d["vol_ratio_5v20"] = round(latest_v5, 2)
+    
+    # 2. 单日放量 (最近3日最大放量倍数)
+    last3_vr = [v[-i] / v5 if v5 > 0 else 1 for i in range(1, 4)]
+    max_vr = max(last3_vr)
+    ds = T.get("daily_spike", {"boundaries": [2.0, 1.5, 1.2], "scores": [15, 10, 5]})
+    s += score_by_boundaries(max_vr, ds["boundaries"], ds["scores"])
+    d["max_daily_vr"] = round(max_vr, 2)
+    
+    # 3. 换手率异动
+    tu = df["换手率"].values if "换手率" in df.columns else v
+    tr = np.mean(tu[-5:]) / np.mean(tu[-20:]) if np.mean(tu[-20:]) > 0 else 1
+    tro = T.get("turnover_ratio", {"boundaries": [2.0, 1.5, 1.2], "scores": [15, 10, 5]})
+    s += score_by_boundaries(tr, tro["boundaries"], tro["scores"])
+    d["turn_ratio"] = round(tr, 2)
+    
+    # 4. 连续价量配合 (3日内放量上涨天数)
+    cu = 0
+    for i in range(1, min(4, len(v))):
+        if v[-i] > v5 * 1.2 and c[-i] > (c[-i-1] if -i-1 >= -len(c) else c[-i]):
+            cu += 1
+    s += cu * 8
+    d["consec_vol_up"] = cu
+    
+    # 5. 量价背离检测 (缩量回调)
+    for i in range(min(15, len(v)-3)):
+        if all(v[-i-j] < v5 * 0.8 for j in range(3) if -i-j >= -len(v)):
+            if c[-1] > np.mean(c[-i-3:-i]) if -i-3 >= -len(c) else False:
+                s += 25; d["pullback_rebound"] = 1; break
+    else:
+        d["pullback_rebound"] = 0
+    
+    return {"score": min(s, 100), "details": d}
+
+
+# ==================== 因子3: 波动结构 ====================
+def factor_volatility(df: pd.DataFrame) -> Dict:
+    if df.empty or len(df) < 20:
+        return {"score": 0, "details": {}}
+    T = FACTOR_THRESHOLDS.get("volatility", {})
+    hi = df["最高"].values if "最高" in df.columns else df["收盘"].values
+    lo = df["最低"].values if "最低" in df.columns else df["收盘"].values
+    cl = df["收盘"].values
+    op = df["开盘"].values if "开盘" in df.columns else cl
+    amp = (np.max(hi[-20:]) - np.min(lo[-20:])) / op[-20] if op[-20] != 0 else 0
+    
+    tr = np.zeros(len(cl))
+    for i in range(1, len(cl)):
+        tr[i] = max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1]))
+    atr = np.mean(tr[-14:]) if len(tr) >= 14 else 0
+    atr_p = np.mean(tr[-19:-14]) if len(tr) >= 19 else 0
+    
+    ad = len(tr) > 0 and len(tr) >= 26 and all(tr[-i] < np.mean(tr[-i-5:-i]) for i in range(1,6) if -i-5 >= -len(tr))
+    ratio = T.get("atr_atr_p_ratio", 1.3)
+    ae = atr > atr_p * ratio if atr_p > 0 else False
+    
+    s = 0
+    amp_boundaries = T.get("amplitude", {"boundaries": [0.15, 0.10], "scores": [20, 10]})
+    s += score_by_boundaries(amp, amp_boundaries["boundaries"], amp_boundaries["scores"])
+    if ad and ae: s += T.get("squeeze_expand_score", 50)
+    elif ae: s += T.get("atr_expand_only_score", 25)
+    if atr > 0:
+        max_pct = T.get("atr_max_pct", 30)
+        s += min(atr / np.mean(cl[-20:]) * 1000, max_pct)
+    return {"score": min(s, 100), "details": {
+        "amp_20": round(amp*100, 2), "atr": round(atr, 2),
+        "atr_expand": int(ae), "pattern": "squeeze_expand" if ad and ae else "normal"}}
+
+
+# ==================== 因子4: 资金关注 ====================
+def factor_capital(df: pd.DataFrame) -> Dict:
+    """资金关注因子 - 成交额趋势+换手率热度+PE估值+相对强弱"""
+    s = 0; d = {}
+    if df.empty or len(df) < 20: return {"score": 0, "details": d}
+    T = FACTOR_THRESHOLDS.get("capital", {})
+    
+    v = df["成交量"].values
+    a = df["成交额"].values if "成交额" in df.columns else np.zeros(len(v))
+    tr = df["换手率"].values if "换手率" in df.columns else np.ones(len(v))
+    c = df["收盘"].values
+    
+    # 1. 成交额趋势 (5日 vs 20日)
+    amt_5 = np.mean(a[-5:]); amt_20 = np.mean(a[-20:])
+    amt_ratio = amt_5 / amt_20 if amt_20 > 0 else 1
+    ar = T.get("amt_ratio", {"boundaries": [2.0, 1.5, 1.2, 0.8], "scores": [25, 18, 12, 6]})
+    s += score_by_boundaries(amt_ratio, ar["boundaries"], ar["scores"])
+    d["amt_ratio_5v20"] = round(amt_ratio, 2)
+    
+    # 2. 换手率趋势 (5日 vs 20日)
+    tr_5 = np.mean(tr[-5:]); tr_20 = np.mean(tr[-20:])
+    tr_ratio = tr_5 / tr_20 if tr_20 > 0 else 1
+    tr_cfg = T.get("tr_ratio", {"boundaries": [2.0, 1.5, 1.2, 0.8], "scores": [20, 14, 8, 4]})
+    s += score_by_boundaries(tr_ratio, tr_cfg["boundaries"], tr_cfg["scores"])
+    d["tr_ratio_5v20"] = round(tr_ratio, 2)
+    
+    # 3. 成交额绝对额分档
+    latest_amt = a[-1]
+    al = T.get("amount_level", {"boundaries": [50e8, 20e8, 10e8, 5e8], "scores": [20, 15, 10, 5]})
+    s += score_by_boundaries(latest_amt, al["boundaries"], al["scores"])
+    d["amount_latest_100m"] = round(latest_amt / 1e8, 1)
+    
+    # 4. PE估值合理性 (direction=lt: 低PE高分)
+    pe = df["市盈率"].dropna().values if "市盈率" in df.columns else np.array([np.nan])
+    if len(pe) > 0 and not np.isnan(pe[-1]) and pe[-1] > 0:
+        pe_latest = pe[-1]
+        pe_cfg = T.get("pe_level", {"boundaries": [15, 25, 40, 60], "scores": [20, 15, 10, 5], "direction": "lt"})
+        s += score_by_boundaries(pe_latest, pe_cfg["boundaries"], pe_cfg["scores"], direction=pe_cfg.get("direction", "gt"))
+        d["pe"] = round(pe_latest, 1)
+    
+    # 5. 60日相对强度
+    if len(c) >= 60:
+        strength = (c[-1] / c[-60] - 1) * 100
+        st = T.get("strength_60d", {"boundaries": [30, 15, 5, -5], "scores": [15, 10, 5, 3]})
+        s += score_by_boundaries(strength, st["boundaries"], st["scores"])
+        d["strength_60d"] = round(strength, 1)
+    
+    return {"score": min(s, 100), "details": d}
+
+
+# ==================== 因子5: 基本面改善 ====================
+def factor_fundamental(code: str, ol: "OptimizedDataLayer") -> Dict:
+    s = 0; d = {}
+    T = FACTOR_THRESHOLDS.get("fundamental", {})
+    try:
+        fin = ol.get_financial(code)
+        if not fin.empty and "净资产收益率" in fin.columns:
+            roe = fin["净资产收益率"].dropna()
+            if not roe.empty:
+                rl = float(roe.iloc[-1])
+                rp = float(roe.iloc[-5]) if len(roe) >= 5 else rl
+                roe_cfg = T.get("roe_level", {"boundaries": [15, 10, 5], "scores": [30, 20, 10]})
+                s += score_by_boundaries(rl, roe_cfg["boundaries"], roe_cfg["scores"])
+                if rl - rp > 0: s += T.get("roe_growth_score", 15)
+                d["roe"] = round(rl, 1)
+                if len(roe) >= 5: d["roe_change"] = round(rl-rp, 1)
+        if "销售毛利率" in fin.columns:
+            gm = fin["销售毛利率"].dropna()
+            if not gm.empty:
+                gl = float(gm.iloc[-1])
+                gm_cfg = T.get("gross_margin", {"boundaries": [40, 20], "scores": [20, 10]})
+                s += score_by_boundaries(gl, gm_cfg["boundaries"], gm_cfg["scores"])
+                d["gross_margin"] = round(gl, 1)
+        if "资产负债率" in fin.columns:
+            dr = fin["资产负债率"].dropna()
+            if not dr.empty:
+                dl = float(dr.iloc[-1])
+                dr_cfg = T.get("debt_ratio", {"boundaries": [30, 50], "scores": [15, 10], "direction": "lt"})
+                s += score_by_boundaries(dl, dr_cfg["boundaries"], dr_cfg["scores"], direction=dr_cfg.get("direction", "gt"))
+                d["debt_ratio"] = round(dl, 1)
+    except Exception as e:
+        log.debug(f"基本面数据获取失败: {e}")
+    return {"score": min(s, 100), "details": d}
+
+
+
+# ==================== 热点主题词库 ====================
+# 来源: ai-news + 市场热点跟踪，可定期更新
+HOT_TOPICS = {
+    "AI大模型": {"keywords": ["科大讯飞","三六零","商汤","云从","格灵深瞳","海天瑞声","拓尔思"], "weight": 30},
+    "半导体/芯片": {"keywords": ["中芯","华虹","长电","韦尔","北方华创","中微","兆易","卓胜微",
+                                "澜起","紫光","国科微","北京君正","圣邦","思瑞浦","纳芯微"], "weight": 30},
+    "算力/AI芯片": {"keywords": ["寒武纪","海光","景嘉微","龙芯","中科曙光","浪潮","曙光"], "weight": 25},
+    "机器人": {"keywords": ["拓普","三花","绿的谐波","双环","汇川","禾川","埃斯顿","新松"], "weight": 25},
+    "低空经济": {"keywords": ["亿航","纵横","中直","万丰","中信海直","莱斯信息"], "weight": 20},
+    "新能源车": {"keywords": ["比亚迪","赛力斯","理想","蔚来","零跑","长安","江淮","北汽蓝谷"], "weight": 20},
+    "光伏": {"keywords": ["隆基","通威","晶科","晶澳","天合","阳光电源","福斯特"], "weight": 15},
+    "创新药": {"keywords": ["恒瑞","百济","信达","康龙","药明","泰格","凯莱英"], "weight": 20},
+    "消费电子": {"keywords": ["立讯","歌尔","蓝思","领益","传音","闻泰","环旭"], "weight": 15},
+    "军工": {"keywords": ["中航","航发","航天","中兵","中国船舶","沈飞","西飞"], "weight": 15},
+    "消费/白酒": {"keywords": ["贵州茅台","五粮液","泸州老窖","汾酒","洋河","古井","舍得","酒鬼","水井坊","青岛","伊利","海天","安井"], "weight": 20},
+    "金融/银行": {"keywords": ["招商银行","工商银行","建设银行","农业银行","中国银行","交通银行","兴业银行","浦发银行","平安银行","中信银行","光大","宁波银行","江苏银行","中国人寿","中国平安","中信证券","东方财富","华泰证券"], "weight": 15},
+    "通信": {"keywords": ["中兴通讯","烽火","亨通","中天","光迅","华工","信科","移动","电信","联通"], "weight": 15},
+    "AI应用/软件": {"keywords": ["金山办公","用友","广联达","宝信","中国软件","太极","深信服","奇安信","启明星辰"], "weight": 20},
+    "电力/能源": {"keywords": ["长江电力","华能","国电电力","大唐","中国核电","中广核","石油","石化","海油","神华","中煤","陕西煤业"], "weight": 10},
+}
+
+RISK_TAGS = {
+    "ST": -30, "*ST": -50, "退市": -50,
+    "立案调查": -40, "涉嫌": -30,
+}
+
+
+def match_hot_topics(name: str) -> Tuple[int, List[str]]:
+    """匹配股票名称与热门主题，返回得分+匹配列表"""
+    if not name:
+        return 0, []
+    score = 0
+    matched = []
+    for topic, info in HOT_TOPICS.items():
+        for kw in info["keywords"]:
+            if kw in name:
+                score += info["weight"]
+                matched.append(topic)
+                break
+    # 风险词降分（按长度降序，子串防重复匹配）
+    _matched_tags = set()
+    for tag in sorted(RISK_TAGS, key=len, reverse=True):
+        if tag in name and not any(tag in mt for mt in _matched_tags):
+            score += RISK_TAGS[tag]
+            matched.append(f"⚠{tag}")
+            _matched_tags.add(tag)
+    return min(score, 100), matched
+
+# ==================== 因子6: 题材文本 ====================
+# AnySearch 情绪缓存
+_anysearch_cache = {}
+
+
+def factor_sentiment(code: str = "", name: str = "", news: str = "") -> Dict:
+    """题材情绪因子 — 多维度情绪评分
+
+    解决 IC=-1 问题: 从单一关键词匹配扩展到4个维度:
+    1. 主题匹配强度 (连续值, 非二值)
+    2. 产业情报评分 (industry_intel 实时数据)
+    3. 量价情绪确认 (价格趋势验证情绪)
+    4. 新闻/事件驱动 (如有输入)
+
+    返回: {"score": 0-100, "details": {各维度明细}}
+    """
+    details = {
+        "topic_score": 0,
+        "intel_score": 0,
+        "price_confirm": 0,
+        "event_score": 0,
+    }
+
+    # 1. 主题匹配 — 连续评分
+    topic_score, matched = match_hot_topics(name)
+    matched_count = len(matched)
+    # 将离散匹配转为连续评分: 匹配数越多分数越高，但每个匹配有衰减
+    if matched_count > 0:
+        # 首匹配权重1.0, 后续每个0.5衰减
+        topic_continuous = sum([1.0 * (0.5 ** i) for i in range(matched_count)])
+        topic_score = min(topic_score, 100) * (0.5 + 0.5 * min(topic_continuous / 3.0, 1.0))
+    details["topic_score"] = round(topic_score, 1)
+
+    # 2. 产业情报增强
+    intel_score = 0.0
+    if name:
+        try:
+            from industry_intel import IndustryIntel
+            ii = IndustryIntel()
+            raw_intel = ii.get_sentiment_score(name)
+            if raw_intel > 0:
+                intel_score = raw_intel
+                details["intel_score"] = round(intel_score, 1)
+        except Exception:
+            pass
+
+    # 3. 量价情绪确认 — 如果kline可用，用价格趋势验证情绪方向
+    # 正向情绪 + 上涨趋势 → 加分；正向情绪 + 下跌 → 减分
+    # (只在被调用时传kline参数)
+    price_confirm = 0.0
+
+    # 4. AnySearch 舆情搜索（新增信源）
+    as_score = 0.0
+    if name and _HAS_ANYSEARCH:
+        cache_key = code + "_" + name
+        if cache_key in _anysearch_cache:
+            as_score = _anysearch_cache[cache_key]
+        else:
+            try:
+                as_score = _anysearch_sentiment(name, code)
+                _anysearch_cache[cache_key] = as_score
+            except Exception:
+                as_score = 50.0
+        details["anysearch_score"] = round(as_score, 1)
+    
+    # 5. 综合评分 (加权)
+    # 主题匹配 30% + 产业情报 25% + AnySearch 25% + 量价确认 20%
+    score = (topic_score * 0.30 + intel_score * 0.25 + as_score * 0.25 + price_confirm * 0.20)
+    
+    # 保留原始细节
+    details["hot_match"] = matched if matched else "none"
+    details["matched_topics"] = matched_count
+
+    return {"score": min(int(score), 100), "details": details}
+
+def factor_alpha191(kline: pd.DataFrame) -> Dict:
+    """Alpha191 精选因子 — 10个短周期价量因子的综合评分"""
+    try:
+        from alpha191_factors import compute_all_alpha191
+        result = compute_all_alpha191(kline)
+        return {"score": min(result.get("score", 0), 100), "details": result.get("details", {})}
+    except ImportError:
+        log.debug("alpha191_factors 模块不可用")
+        return {"score": 0, "details": {}}
+    except Exception as e:
+        log.debug(f"Alpha191计算失败: {e}")
+        return {"score": 0, "details": {}}
+
+# ==================== 综合评分器 ====================
+# ==================== 因子8: 分析框架综合 ====================
+def factor_frameworks(df: pd.DataFrame, stock_name: str = "", code: str = "",
+                       industry: str = "", financials: dict = None) -> Dict:
+    """17 个投资分析框架因子化评分"""
+    try:
+        result = apply_all_frameworks(
+            df=df, stock_name=stock_name, code=code, industry=industry,
+            financials=financials,
+        )
+        score = min(10, result["total_score"] // 10)
+        if result.get("hard_reject"):
+            return {"score": 0, "hard_reject": True, "details": result}
+        return {"score": score, "details": result}
+    except Exception as e:
+        log.warning(f"分析框架评分异常: {e}")
+        return {"score": 5, "details": {"error": str(e)}}
+
+
+class FactorScorer:
+    def __init__(self, name_map: dict = None):
+        self.ol = get_provider()
+        self.name_map = name_map or {}
+        self.w = {k: v["weight"] for k, v in CONFIG["factors"].items()}
+
+    def score_stock(self, code: str, kline=None) -> Dict:
+        if kline is None:
+            kline = self.ol.get_kline(code, days=120)
+        f1 = factor_trend(kline)
+        f2 = factor_volume(kline)
+        f3 = factor_volatility(kline)
+        f4 = factor_capital(kline)
+        f5 = factor_fundamental(code, self.ol)
+        name = self.name_map.get(code, "")
+        f6 = factor_sentiment(code, name=name)
+        f7 = factor_alpha191(kline)
+        # 分析框架因子（8号因子）
+        f8_input = {"financials": {}}
+        try:
+            from data_provider import get_provider
+            ol_provider = get_provider()
+            fin = ol_provider.get_financials(code) if hasattr(ol_provider, 'get_financials') else {}
+            f8_input["financials"] = fin if fin else {}
+        except Exception:
+            pass
+        f8 = factor_frameworks(kline, stock_name=name, code=code)
+        f9 = factor_consensus(code) if HAS_CONSENSUS else {"score": 5, "details": {}}
+        f10 = factor_capital_flow(code) if HAS_CAPITAL_FLOW else {"score": 5, "details": {}}
+        f11 = factor_market_signal(code) if HAS_MARKET_SIGNAL else {"score": 5, "details": {}}
+        # FactorHub 因子（可选增量通道）
+        if HAS_FACTORHUB:
+            try:
+                _fh_scores = batch_factorhub_scores([code])
+                fh_score = _fh_scores.get(code, 0.0) if _fh_scores else 0.0
+            except Exception:
+                fh_score = 0.0
+        else:
+            fh_score = 0.0
+        f12 = {"score": fh_score, "details": {}}
+        # 事件因子
+        try:
+            ev_score = _event_score(code)
+        except Exception:
+            ev_score = 50.0
+        f13 = {"score": ev_score, "details": {}}
+        total = (f1["score"] * self.w.get("trend", 0.18) +
+                 f2["score"] * self.w.get("volume", 0.13) +
+                 f3["score"] * self.w.get("volatility", 0.09) +
+                 f4["score"] * self.w.get("capital", 0.18) +
+                 f5["score"] * self.w.get("fundamental", 0.22) +
+                 f6["score"] * self.w.get("sentiment", 0.10) +
+                 f7["score"] * self.w.get("alpha191", 0.10) +
+                f8["score"] * self.w.get("frameworks", 0.10) +
+                f9["score"] * self.w.get("consensus", 0.06) +
+                f10["score"] * self.w.get("capital_flow", 0.06) +
+                f11["score"] * self.w.get("market_signal", 0.06) +
+                 f12["score"] * self.w.get("factorhub", 0.05) +
+                 f13["score"] * self.w.get("event_factor", 0.00))
+        return {"code": code, "total_score": round(total, 1),
+                "factors": {"trend": f1, "volume": f2, "volatility": f3,
+                           "capital": f4, "fundamental": f5, "sentiment": f6, 
+                           "alpha191": f7, "frameworks": f8,
+                           "consensus": f9, "capital_flow": f10, "market_signal": f11,
+                            "factorhub": f12,
+                            "event": f13}}
+
+    def batch_score(self, codes: list) -> pd.DataFrame:
+        rows = []
+        for code in codes:
+            try:
+                r = self.score_stock(code)
+                row = {"code": code, "total": r["total_score"]}
+                for fn, fd in r["factors"].items():
+                    if isinstance(fd, dict):
+                        row[f"{fn}"] = fd.get("score", 0)
+                    else:
+                        row[f"{fn}"] = fd
+                rows.append(row)
+            except Exception as e:
+                log.debug(f"跳过股票 {code}: {e}")
+        df = pd.DataFrame(rows)
+        if not df.empty: df.sort_values("total", ascending=False, inplace=True)
+        return df

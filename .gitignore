@@ -1,0 +1,32 @@
+# Secrets
+.env
+*.bak
+config.json.bak
+
+# Cache
+_cache/
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+*.log
+
+# Reports (auto-generated)
+reports/
+tracking/predictions/*.json
+
+# IDE
+.vscode/
+.idea/
+
+# Data files
+*.db
+*.csv
+*.json
+!config/*.json
+data/
+tracking/predictions/*.json
+tracking/factor_snapshot_*.csv
+reports/daily*.html
+reports/daily*.md

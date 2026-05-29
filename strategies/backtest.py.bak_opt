@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""
+Layer 4 — 回测层
+=================
+Backtrader策略引擎 — 支持单股/多股组合回测
+"""
+
+import sys, json, logging
+from config_loader import IE_SCRIPTS, CFG, BACKTEST_CFG as BT_CFG
+import backtrader as bt
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import List, Optional
+
+log = logging.getLogger("backtest_layer")
+
+
+# ==================== 组合策略（多股） ====================
+
+class FactorPortfolioStrategy(bt.Strategy):
+    """因子选股组合策略 — 定期再平衡"""
+
+    params = (
+        ("top_n", 5),           # 持仓数量
+        ("rebalance_days", 20), # 再平衡周期（交易日）
+        ("stop_loss", -0.15),   # 止损线
+        ("take_profit", 0.30),  # 止盈线
+        ("max_pos_pct", 0.15),  # 单只最大仓位
+    )
+
+    def __init__(self):
+        self.order = None
+        self.entry_prices = {}
+        self.bar_count = 0
+        self.orders = {}
+        self.daily_values = []  # 每日组合净值
+
+    def next(self):
+        self.bar_count += 1
+        self.daily_values.append(self.broker.get_value())  # 记录每日净值
+
+        # 1. 检查止损/止盈
+        for data in self.datas:
+            code = data._name
+            if code in self.entry_prices:
+                ret = (data.close[0] - self.entry_prices[code]) / self.entry_prices[code]
+                if ret < self.p.stop_loss or ret > self.p.take_profit:
+                    log.info(f"  [{self.bar_count}] 触发{'止损' if ret < self.p.stop_loss else '止盈'}: "
+                             f"{code} ret={ret:.1%}")
+                    self.close(data=data)
+                    self.entry_prices.pop(code, None)
+                    self.orders.pop(code, None)
+
+        # 2. 定期再平衡
+        if self.bar_count % self.p.rebalance_days != 0:
+            return
+
+        # 已有持仓过少时也触发再平衡
+        open_positions = len([d for d in self.datas if self.getposition(d).size > 0])
+        if open_positions >= self.p.top_n:
+            return
+
+        log.info(f"[再平衡] bar={self.bar_count} 当前持仓={open_positions}/{self.p.top_n}")
+        cash_per_stock = self.broker.get_cash() / max(self.p.top_n - open_positions, 1)
+        
+        if cash_per_stock <= 0 or np.isnan(cash_per_stock):
+            return
+
+        # 买入未持仓且排名靠前的股票
+        for i, data in enumerate(self.datas[:self.p.top_n]):
+            code = data._name
+            if code in self.entry_prices or self.getposition(data).size > 0:
+                continue
+            if data.close[0] <= 0 or np.isnan(data.close[0]) or cash_per_stock < data.close[0] * 100:
+                continue
+
+            size = int(cash_per_stock * 0.95 / data.close[0])
+            if size < 100:
+                size = int(cash_per_stock / data.close[0])  # 不够1手也按股数买
+
+            if size > 0 and self.broker.get_cash() > data.close[0] * size:
+                self.orders[code] = self.buy(data=data, size=size)
+                self.entry_prices[code] = data.close[0]
+                log.info(f"  买入 {code} @ {data.close[0]:.2f} x {size}股")
+
+
+# ==================== 单股独立回测 ====================
+
+
+# ==================== 绩效指标计算 ====================
+
+class PerformanceMetrics:
+    """绩效指标计算器 — Sharpe/Sortino/Calmar/最大回撤/胜率"""
+
+    @staticmethod
+    def sharpe_ratio(returns, rf=0.02):
+        if len(returns) < 5 or returns.std() == 0:
+            return 0.0
+        excess = returns.mean() * 252 - rf
+        vol = returns.std() * (252 ** 0.5)
+        return float(excess / vol) if vol > 0 else 0.0
+
+    @staticmethod
+    def sortino_ratio(returns, rf=0.02):
+        if len(returns) < 5:
+            return 0.0
+        excess = returns.mean() * 252 - rf
+        downside = returns[returns < 0].std() * (252 ** 0.5)
+        return float(excess / downside) if downside > 0 else 0.0
+
+    @staticmethod
+    def calmar_ratio(returns):
+        ann_ret = float((1 + returns.mean()) ** 252 - 1)
+        max_dd = PerformanceMetrics.max_drawdown(returns)
+        return float(ann_ret / abs(max_dd)) if max_dd < 0 else 0.0
+
+    @staticmethod
+    def max_drawdown(returns):
+        if len(returns) < 2:
+            return 0.0
+        cum = (1 + returns).cumprod()
+        peak = cum.expanding().max()
+        dd = (cum - peak) / peak
+        return float(dd.min())
+
+    @staticmethod
+    def win_rate(returns):
+        monthly = returns.resample("ME").apply(lambda x: (1 + x).prod() - 1) if hasattr(returns.index, 'freq') else returns
+        wins = (monthly > 0).sum()
+        return float(wins / len(monthly)) if len(monthly) > 0 else 0.0
+
+
+    @staticmethod
+    def drawdown_duration(returns):
+        if len(returns) < 2:
+            return 0
+        cum = (1 + returns).cumprod()
+        peak = cum.expanding().max()
+        dd = (cum - peak) / peak
+        if dd.min() >= 0:
+            return 0
+        trough_idx = dd.idxmin()
+        recovery = cum.loc[trough_idx:]
+        recovered = recovery[recovery >= cum.loc[trough_idx]]
+        return len(recovered) if len(recovered) > 0 else len(returns) - list(returns.index).index(trough_idx)
+
+    @staticmethod
+    def profit_loss_ratio(returns):
+        monthly = returns.resample("ME").apply(lambda x: (1 + x).prod() - 1) if hasattr(returns.index, 'freq') else returns
+        wins = monthly[monthly > 0]
+        losses = monthly[monthly < 0]
+        avg_win = wins.mean() if len(wins) > 0 else 0
+        avg_loss = abs(losses.mean()) if len(losses) > 0 else 1
+        return float(avg_win / avg_loss) if avg_loss > 0 else 0.0
+
+    @staticmethod
+    def rolling_return(returns, window=252):
+        return returns.rolling(window).apply(lambda x: (1 + x).prod() - 1)
+
+    @staticmethod
+    def all_metrics(returns):
+        return {
+            "sharpe_ratio": round(PerformanceMetrics.sharpe_ratio(returns), 3),
+            "sortino_ratio": round(PerformanceMetrics.sortino_ratio(returns), 3),
+            "calmar_ratio": round(PerformanceMetrics.calmar_ratio(returns), 3),
+            "max_drawdown": round(PerformanceMetrics.max_drawdown(returns), 4),
+            "win_rate": round(PerformanceMetrics.win_rate(returns), 3),
+            "annualized_return": round(float((1 + returns.mean()) ** 252 - 1), 4),
+            "annualized_vol": round(float(returns.std() * (252 ** 0.5)), 4),
+            "total_return": round(float((1 + returns).prod() - 1), 4),
+            "sample_days": len(returns),
+        }
+
+
+
+def run_single(data_df: pd.DataFrame, code: str,
+               cash: float = None, commission: float = None) -> dict:
+    """单只股票独立回测 — 买入持有"""
+    cash = cash or BT_CFG.get("initial_cash", 1000000)
+    commission = commission or BT_CFG.get("commission", 0.0003)
+
+    cerebro = bt.Cerebro()
+    cerebro.broker.setcash(cash)
+    cerebro.broker.setcommission(commission=commission)
+
+    df = data_df.copy()
+    if "日期" in df.columns:
+        df["datetime"] = pd.to_datetime(df["日期"])
+        df.set_index("datetime", inplace=True)
+    elif not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    col_map = {"开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume", "成交额": "amount"}
+    for cn, en in col_map.items():
+        if cn in df.columns and en not in df.columns:
+            df[en] = df[cn]
+    if "open" not in df.columns:
+        return {"status": "error", "msg": "缺少开盘价列"}
+    if "openinterest" not in df.columns:
+        df["openinterest"] = 0
+    data = bt.feeds.PandasData(dataname=df)
+    cerebro.adddata(data, name=code)
+
+    cerebro.addstrategy(FactorPortfolioStrategy,
+                        top_n=1, rebalance_days=1,
+                        max_pos_pct=1.0)
+
+    cerebro.run()
+    final = cerebro.broker.getvalue()
+    ret = (final / cash - 1) * 100
+    return {
+        "code": code,
+        "initial": cash,
+        "final": round(final, 2),
+        "return_pct": round(ret, 2),
+        "status": "ok"
+    }
+
+
+# ==================== 组合回测（多股） ====================
+
+def run_portfolio(ranked_codes: List[str], price_data: dict,
+                  cash: float = None, commission: float = None,
+                  top_n: int = 5, rebalance_days: int = 20) -> dict:
+    """
+    组合回测 — 基于因子排名的定期再平衡
+
+    参数:
+        ranked_codes: 按因子总分排名的股票列表（从高到低）
+        price_data: {code: pd.DataFrame} 各股K线数据
+        cash: 初始资金
+        top_n: 持仓数量
+        rebalance_days: 再平衡周期（交易日）
+    """
+    cash = cash or BT_CFG.get("initial_cash", 1000000)
+    commission = commission or BT_CFG.get("commission", 0.0003)
+
+    cerebro = bt.Cerebro()
+    cerebro.broker.setcash(cash)
+    cerebro.broker.setcommission(commission=commission)
+
+    # 加入排名前N的股票数据
+    added = 0
+    for code in ranked_codes:
+        if code not in price_data:
+            continue
+        df = price_data[code].copy()
+        if df.empty or len(df) < 60:
+            continue
+        if "日期" in df.columns:
+            df["datetime"] = pd.to_datetime(df["日期"])
+            df.set_index("datetime", inplace=True)
+        elif not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        col_map = {"开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume", "成交额": "amount"}
+        for cn, en in col_map.items():
+            if cn in df.columns and en not in df.columns:
+                df[en] = df[cn]
+        if "open" not in df.columns:
+            continue
+        if "openinterest" not in df.columns:
+            df["openinterest"] = 0
+        data = bt.feeds.PandasData(dataname=df)
+        cerebro.adddata(data, name=code)
+        added += 1
+        if added >= top_n * 2:  # 加入2倍候选以防数据不完整
+            break
+
+    # 如果没有加入任何股票，返回空结果
+    if cerebro.datas == []:
+        return {"status": "no_data", "stocks": 0, "return_pct": 0}
+
+    cerebro.addstrategy(FactorPortfolioStrategy,
+                        top_n=top_n,
+                        rebalance_days=rebalance_days,
+                        stop_loss=BT_CFG.get("stop_loss", -0.15),
+                        take_profit=BT_CFG.get("take_profit", 0.30),
+                        max_pos_pct=BT_CFG.get("max_position_pct", 0.15))
+
+    cerebro.run()
+    final = cerebro.broker.getvalue()
+    ret = (final / cash - 1) * 100
+
+    # 提取每日净值序列 (cerebro.strats[0] = (strategy_class, strategy_instance, ...))
+    strat = cerebro.strats[0][0] if cerebro.strats and cerebro.strats[0] else None
+    daily_values = strat.daily_values if hasattr(strat, 'daily_values') else [cash]
+
+    # ── 过拟合检测（2026-05-27 新增）──
+    daily_returns = [round((daily_values[i] / daily_values[i-1] - 1), 6)
+                    for i in range(1, len(daily_values))] if len(daily_values) > 1 else []
+    overfit = {}
+    if len(daily_returns) > 120:
+        try:
+            from overfit_detector import full_overfit_assessment
+            split = max(60, len(daily_returns) // 3)
+            is_rets = np.array(daily_returns[:-split])
+            oos_rets = np.array(daily_returns[-split:])
+            overfit = full_overfit_assessment(is_rets, oos_rets)
+        except Exception as e:
+            overfit = {"verdict": "error", "reason": str(e)}
+
+    return {
+        "status": "ok",
+        "stocks": added,
+        "top_n": top_n,
+        "rebalance_days": rebalance_days,
+        "initial": cash,
+        "final": round(final, 2),
+        "return_pct": round(ret, 2),
+        "daily_values": daily_values,
+        "daily_returns": daily_returns,
+        "overfit": overfit,
+    }
+
+def walk_forward_cv(price_data: dict, ranked_codes_by_period: dict,
+                    n_splits: int = 4, top_n: int = 5,
+                    rebalance_days: int = 20, cash: float = None) -> dict:
+    """Walk-Forward 交叉验证回测 — 防前瞻性偏差
+    
+    将数据按时间顺序分为 N 折。每折：前 k 折为训练期（用于选股），
+    后 1 折为测试期（用于验证），保证测试期数据不会被训练期看到。
+    
+    参数:
+        price_data: {code: pd.DataFrame}
+        ranked_codes_by_period: {period_key: [ranked_codes]} 
+            每个时间段（如每季）的因子排名列表，按时间顺序
+        n_splits: 分割折数
+        top_n: 每期持仓数
+        rebalance_days: 再平衡周期
+        cash: 初始资金
+    
+    返回:
+        {"status": str, "fold_results": [{fold}], "avg_return": float, ...}
+    """
+    from copy import deepcopy
+    
+    if cash is None:
+        cash = BT_CFG.get("initial_cash", 1000000)
+    
+    periods = sorted(ranked_codes_by_period.keys())
+    if len(periods) < n_splits:
+        log.warning(f"时间段数({len(periods)})小于分割数({n_splits})，使用全部数据")
+        return run_portfolio(
+            list(ranked_codes_by_period.values())[-1] if ranked_codes_by_period else [],
+            price_data, cash=cash, top_n=top_n, rebalance_days=rebalance_days
+        )
+    
+    split_size = len(periods) // n_splits
+    fold_results = []
+    
+    for fold in range(1, n_splits):
+        # 训练期: periods[0] 到 periods[fold * split_size - 1]
+        # 测试期: periods[fold * split_size] 到 periods[-1]
+        train_end = fold * split_size
+        test_start = train_end
+        
+        # 使用测试期的排名（实际会用当前可用信息）
+        test_codes = []
+        for p in periods[test_start:]:
+            test_codes.extend(ranked_codes_by_period.get(p, []))
+        # 去重保持顺序
+        seen = set()
+        test_codes_unique = [c for c in test_codes if not (c in seen or seen.add(c))]
+        
+        result = run_portfolio(
+            test_codes_unique, price_data,
+            cash=cash, top_n=top_n, rebalance_days=rebalance_days
+        )
+        result["fold"] = fold
+        result["train_period"] = f"{periods[0]}~{periods[train_end-1] if train_end > 0 else periods[0]}"
+        result["test_period"] = f"{periods[test_start]}~{periods[-1]}"
+        fold_results.append(result)
+    
+    returns = [r.get("return_pct", 0) for r in fold_results if r.get("status") == "ok"]
+    
+    return {
+        "status": "ok",
+        "n_splits": n_splits,
+        "fold_results": fold_results,
+        "avg_return": round(np.mean(returns), 2) if returns else 0,
+        "max_return": round(max(returns), 2) if returns else 0,
+        "min_return": round(min(returns), 2) if returns else 0,
+        "all_returns": returns,
+    }
